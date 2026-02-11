@@ -278,6 +278,33 @@ async def end_contest(app, force_manual=False):
             pass
         return False, str(e)
 
+# ================= CONTEST HELPERS (آمنة للاستخدام في الكول باك) =================
+async def _create_contest_db(minutes: int, winners: int):
+    """إنشاء مسابقة في قاعدة البيانات فقط (بدون إرسال رسائل)"""
+    end_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    cursor.execute("DELETE FROM contest")
+    cursor.execute("INSERT INTO contest (id, active, end_time, winners) VALUES (1, 1, ?, ?)", 
+                  (end_time.isoformat(), winners))
+    cursor.execute("UPDATE users SET points=0")
+    conn.commit()
+    logger.info(f"بدأت مسابقة جديدة: {minutes} دقيقة، {winners} فائزين")
+    return minutes, winners
+
+def _get_contest_start_message(minutes: int, winners: int):
+    """إرجاع رسالة بدء المسابقة جاهزة للإرسال"""
+    contest_msg = (
+        f"🚀 <b>بدأت مسابقة الإحالات!</b>\n\n"
+        f"⏰ <b>المدة:</b> {minutes} دقيقة\n"
+        f"🏆 <b>عدد الفائزين:</b> {winners}\n"
+        f"💎 <b>النقاط لكل إحالة:</b> {get_setting('points')}\n\n"
+        f"🎯 <i>كل إحالة ناجحة تضيف نقاطاً لحسابك بعد {get_setting('delay')} دقائق</i>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 إنهاء المسابقة يدويًا", callback_data="confirm_end_contest_warning")],
+        [InlineKeyboardButton("📊 عرض الترتيب الحالي", callback_data="show_contest_ranking")]
+    ])
+    return contest_msg, keyboard
+
 # ================= CONTEST COMMANDS =================
 async def start_contest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -301,36 +328,9 @@ async def start_contest_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"⚠️ خطأ: {e}\n\nاستخدم:\n/startcontest <الدقائق> <عدد_الفائزين>")
         return
 
-    await _create_contest(update, context, minutes, winners)
-
-async def _create_contest(update: Update, context: ContextTypes.DEFAULT_TYPE, minutes: int, winners: int):
-    end_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-
-    cursor.execute("DELETE FROM contest")
-    cursor.execute("INSERT INTO contest (id, active, end_time, winners) VALUES (1, 1, ?, ?)", 
-                  (end_time.isoformat(), winners))
-    cursor.execute("UPDATE users SET points=0")
-    conn.commit()
-
-    contest_msg = (
-        f"🚀 <b>بدأت مسابقة الإحالات!</b>\n\n"
-        f"⏰ <b>المدة:</b> {minutes} دقيقة\n"
-        f"🏆 <b>عدد الفائزين:</b> {winners}\n"
-        f"💎 <b>النقاط لكل إحالة:</b> {get_setting('points')}\n\n"
-        f"🎯 <i>كل إحالة ناجحة تضيف نقاطاً لحسابك بعد {get_setting('delay')} دقائق</i>"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛑 إنهاء المسابقة يدويًا", callback_data="confirm_end_contest_warning")],
-        [InlineKeyboardButton("📊 عرض الترتيب الحالي", callback_data="show_contest_ranking")]
-    ])
-    
-    await update.effective_message.reply_text(
-        contest_msg,
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-    logger.info(f"بدأت مسابقة جديدة: {minutes} دقيقة، {winners} فائزين")
+    await _create_contest_db(minutes, winners)
+    contest_msg, keyboard = _get_contest_start_message(minutes, winners)
+    await update.message.reply_text(contest_msg, parse_mode="HTML", reply_markup=keyboard)
 
 async def end_contest_manual_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -378,6 +378,8 @@ async def end_contest_manual_command(update: Update, context: ContextTypes.DEFAU
     )
 
 # ================= REFERRAL ENGINE (بدون Job Queue) =================
+background_task = None
+
 async def background_tasks(app):
     """المهمة الخلفية بدون الحاجة لـ Job Queue"""
     while True:
@@ -922,6 +924,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     user_id = query.from_user.id
     
+    # ✅ الإجابة الفورية لتجنب مؤشر التحميل الأبدي
     try:
         await query.answer()
     except Exception as e:
@@ -930,6 +933,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
     try:
         data = query.data
         
+        # معالجة نسخ الرابط
         if data == "copy_link_info":
             await query.answer(
                 "✅ للنسخ: اضغط مطولًا على الرابط أعلاه واختر 'نسخ الرابط'",
@@ -937,6 +941,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         
+        # العودة للقائمة الرئيسية
         if data == "main_menu":
             await query.message.reply_text(
                 "🏠 <b>القائمة الرئيسية</b>",
@@ -949,13 +954,14 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # عرض رابط الإحالة
         if data.startswith("show_link_"):
             target_user_id = int(data.split("_")[2])
             cursor.execute("SELECT points FROM users WHERE user_id=?", (target_user_id,))
             points = cursor.fetchone()[0] or 0
             
             bot_username = context.bot.username
-            referral_link = f"https://t.me/{bot_username}?start={target_user_id}"
+            referral_link = f"https://t.me/{bot_username}?start={target_user_id}"  # ✅ رابط صحيح
             
             await query.message.reply_text(
                 f"🔗 <b>رابط الإحالة:</b>\n<code>{referral_link}</code>\n\n💎 <b>نقاطك:</b> {points}",
@@ -968,6 +974,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # عرض الترتيب
         if data == "show_ranking":
             cursor.execute("""
                 SELECT username, first_name, points 
@@ -993,6 +1000,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         
+        # حالة المسابقة
         if data == "show_contest_status":
             cursor.execute("SELECT active, end_time, winners FROM contest WHERE id=1")
             contest = cursor.fetchone()
@@ -1009,6 +1017,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
             await query.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
             return
         
+        # بدء مسابقة جديدة (من لوحة التحكم)
         if data == "start_new_contest":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1024,6 +1033,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # إنهاء المسابقة (تحذير أولي)
         if data == "confirm_end_contest_warning":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1035,11 +1045,29 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 await query.answer("لا توجد مسابقة نشطة", show_alert=True)
                 return
                 
+            # عرض معاينة الترتيب
+            cursor.execute("""
+                SELECT username, first_name, points 
+                FROM users 
+                WHERE points > 0 
+                ORDER BY points DESC 
+                LIMIT 10
+            """)
+            top_users = cursor.fetchall()
+            
+            preview = "📊 <b>الترتيب الحالي (أعلى 10):</b>\n\n"
+            for i, (username, first_name, points) in enumerate(top_users, 1):
+                display_name = f"@{sanitize_username(username)}" if username else escape_html(first_name or f"مستخدم #{i}")
+                preview += f"{i}. {display_name} | {points} نقطة\n"
+            if not top_users:
+                preview = "📭 لا توجد إحالات مسجلة بعد"
+            
             await query.message.reply_text(
-                "🛑 <b>تأكيد إنهاء المسابقة</b>\n\n"
-                "هل أنت متأكد من إنهاء المسابقة يدويًا؟\n"
-                "سيتم اختيار الفائزين فورًا وإعلانهم.\n\n"
-                "⚠️ لا يمكن التراجع بعد التأكيد!",
+                f"🛑 <b>تأكيد إنهاء المسابقة</b>\n\n"
+                f"هل أنت متأكد من إنهاء المسابقة يدويًا؟\n"
+                f"سيتم اختيار الفائزين فورًا وإعلانهم.\n\n"
+                f"🏆 سيتم اختيار <b>{contest[1]}</b> فائزين:\n{preview}\n\n"
+                f"⚠️ لا يمكن التراجع بعد التأكيد!",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ نعم، أنهِ الآن", callback_data="confirm_end_contest")],
                     [InlineKeyboardButton("❌ إلغاء", callback_data="cancel_end_contest")]
@@ -1052,6 +1080,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # تأكيد إنهاء المسابقة
         if data == "confirm_end_contest":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1069,10 +1098,12 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 await query.edit_message_text(f"❌ فشل إنهاء المسابقة:\n{result}")
             return
         
+        # إلغاء العمليات
         if data in ["cancel_end_contest", "cancel_contest"]:
             await query.edit_message_text("❌ تم إلغاء العملية")
             return
         
+        # بدء مسابقة سريعة - ✅ الإصلاح الرئيسي هنا
         if data.startswith("quick_contest_"):
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1080,13 +1111,25 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 
             parts = data.replace("quick_contest_", "").split("_")
             minutes, winners = int(parts[0]), int(parts[1])
-            await _create_contest(query, context, minutes, winners)
+            
+            # ✅ استخدام الدوال الآمنة للكول باك
+            await _create_contest_db(minutes, winners)
+            contest_msg, keyboard = _get_contest_start_message(minutes, winners)
+            
+            # ✅ استخدام query.message.reply_text بدلاً من update.effective_message
+            await query.message.reply_text(
+                contest_msg,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            
             try:
                 await query.message.delete()
             except:
                 pass
             return
         
+        # عرض الترتيب الكامل (للمشرفين)
         if data == "show_full_ranking":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1119,6 +1162,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         
+        # عرض الترتيب الحالي للمسابقة
         if data == "show_contest_ranking":
             cursor.execute("""
                 SELECT username, first_name, points 
@@ -1144,6 +1188,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
             )
             return
         
+        # إعدادات النقاط
         if data == "settings_points":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1161,6 +1206,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # إعدادات التأخير
         if data == "settings_delay":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1178,6 +1224,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # قائمة البث
         if data == "broadcast_menu":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1195,6 +1242,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # قائمة الرسائل الفردية
         if data == "send_menu":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1212,6 +1260,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # قائمة النسخ الاحتياطي
         if data == "backup_menu":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1229,6 +1278,7 @@ async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT
                 pass
             return
         
+        # قائمة الاستيراد
         if data == "import_menu":
             if not is_admin(user_id):
                 await query.answer("❌ هذا الإجراء متاح للمشرفين فقط", show_alert=True)
@@ -1321,8 +1371,6 @@ async def broadcast_callback_handler(update: Update, context: ContextTypes.DEFAU
         logger.info(f"اكتمل البث: ناجح {success} / فشل {failed} من أصل {total}")
 
 # ================= SHUTDOWN HANDLER =================
-background_task = None
-
 async def shutdown(app):
     global background_task
     try:
@@ -1382,7 +1430,7 @@ def main():
 
     logger.info("🚀 Elite Referral Bot يعمل الآن...")
     print("="*50)
-    print("✅ البوت نشط ويعمل بشكل كامل بدون Job Queue!")
+    print("✅ البوت نشط ويعمل بشكل كامل بدون أخطاء!")
     print("="*50)
     print("✨ الميزات:")
     print("   • واجهة جميلة بأزرار تفاعلية تعمل 100%")
@@ -1390,6 +1438,14 @@ def main():
     print("   • مسابقات مع إنهاء يدوي/تلقائي")
     print("   • حماية كاملة لصلاحيات المشرف")
     print("   • يعمل على جميع المنصات (بما فيها Render)")
+    print("="*50)
+    try:
+        bot_info = app.bot
+        print(f"🤖 يوزر البوت: @{bot_info.username}")
+    except:
+        print("🤖 يوزر البوت: سيتم عرضه بعد التشغيل")
+    print(f"👑 معرف المشرف: {ADMIN_ID}")
+    print(f"📢 القناة: {CHANNEL_USERNAME}")
     print("="*50)
     app.run_polling(close_loop=False)
 
